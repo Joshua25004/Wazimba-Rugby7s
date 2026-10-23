@@ -1,8 +1,22 @@
 from rest_framework import serializers
 from .models import AlumniProfile, Announcement, InjuryRecord, LearningResource, Match, MatchParticipation, MatchReview, MediaAsset, Player, Season, SeasonRegistration, TeamEvent, TeamEventAttendance, Tournament, TrainingAttendance, TrainingSession
 
+
 class PlayerSerializer(serializers.ModelSerializer):
-    class Meta: model = Player; fields = '__all__'
+    class Meta:
+        model = Player
+        fields = '__all__'
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+
+        # Hide player email addresses from non-staff users.
+        if not (request and request.user.is_staff):
+            data['email'] = ''
+
+        return data
+
 class SeasonSerializer(serializers.ModelSerializer):
     class Meta: model = Season; fields = '__all__'
 class SeasonRegistrationSerializer(serializers.ModelSerializer):

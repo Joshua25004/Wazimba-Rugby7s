@@ -3,9 +3,9 @@ from datetime import date, time
 from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase
 
-from .models import (AlumniProfile, Announcement, LearningResource, MediaAsset,
-                     Match, MatchParticipation, Player, Season, TeamEvent,
-                     Tournament, TrainingAttendance, TrainingSession)
+from .models import (AlumniProfile, Announcement, LearningResource, MatchReview,
+                     MediaAsset, Match, MatchParticipation, Player, Season,
+                     TeamEvent, Tournament, TrainingAttendance, TrainingSession)
 
 
 class WazimbaApiTests(APITestCase):
@@ -127,3 +127,104 @@ class WazimbaApiTests(APITestCase):
         self.client.force_authenticate(self.member)
         self.assertEqual(self.client.get('/api/performance/team/', {'season': 'not-a-number'}).status_code, 400)
         self.assertEqual(self.client.get('/api/performance/players/', {'player': 'not-a-number'}).status_code, 400)
+    
+    def test_alumni_contact_email_respects_consent(self):
+        alumni = AlumniProfile.objects.create(
+            full_name='Privacy Test Alumni',
+            contact_email='private@example.org',
+            contact_consent=False,
+        )
+
+        # Ordinary members should not see the email without consent.
+        self.client.force_authenticate(self.member)
+        response = self.client.get(f'/api/alumni/{alumni.id}/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['contact_email'], '')
+
+        # Staff can access the email even without consent.
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(f'/api/alumni/{alumni.id}/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data['contact_email'],
+            'private@example.org',
+        )
+
+        # With consent, ordinary members can see the email.
+        alumni.contact_consent = True
+        alumni.save(update_fields=['contact_consent'])
+
+        self.client.force_authenticate(self.member)
+        response = self.client.get(f'/api/alumni/{alumni.id}/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data['contact_email'],
+            'private@example.org',
+        )
+        
+    def test_match_reviews_are_readable_by_members_but_writable_only_by_staff(self):
+        review = MatchReview.objects.create(
+            match=self.match,
+            went_well='Good support lines',
+            needs_work='Improve defensive alignment',
+        )
+
+        # Ordinary members can read the review list and individual reviews.
+        self.client.force_authenticate(self.member)
+        self.assertEqual(
+            self.client.get('/api/match-reviews/').status_code, 200
+        )
+        self.assertEqual(
+            self.client.get(f'/api/match-reviews/{review.id}/').status_code, 200
+        )
+
+        # Ordinary members cannot edit or delete reviews.
+        self.assertEqual(
+            self.client.patch(
+                f'/api/match-reviews/{review.id}/',
+                {'went_well': 'Changed by member'},
+                format='json',
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.delete(f'/api/match-reviews/{review.id}/').status_code,
+            403,
+        )
+
+        # Staff can edit and delete reviews.
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(
+            self.client.patch(
+                f'/api/match-reviews/{review.id}/',
+                {'went_well': 'Updated by staff'},
+                format='json',
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.delete(f'/api/match-reviews/{review.id}/').status_code,
+            204,
+        )
+        
+    def test_player_email_is_visible_to_staff_only(self):
+        player = Player.objects.create(
+            full_name='Privacy Test Player',
+            email='player-private@example.org',
+        )
+
+        # Ordinary authenticated members can view the profile,
+        # but the email address must be hidden.
+        self.client.force_authenticate(self.member)
+        response = self.client.get(f'/api/players/{player.id}/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['email'], '')
+
+        # Staff can view the actual email address.
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(f'/api/players/{player.id}/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data['email'],
+            'player-private@example.org',
+        )
