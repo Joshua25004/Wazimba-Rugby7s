@@ -1,6 +1,6 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
-from .views import AlumniProfileViewSet, AnnouncementViewSet, InjuryRecordViewSet, LearningResourceViewSet, MatchParticipationViewSet, MatchReviewViewSet, MatchViewSet, MediaAssetViewSet, PlayerPerformanceView, PlayerViewSet, ReportsCSVView, ReportsView, SeasonRegistrationViewSet, SeasonViewSet, TeamAnalyticsView, TeamEventAttendanceViewSet, TeamEventViewSet, TournamentViewSet, TrainingAttendanceViewSet, TrainingSessionViewSet
+from .views import NewsArticleViewSet, AlumniProfileViewSet, AnnouncementViewSet, InjuryRecordViewSet, LearningResourceViewSet, MatchParticipationViewSet, MatchReviewViewSet, MatchViewSet, MediaAssetViewSet, PlayerPerformanceView, PlayerViewSet, ReportsCSVView, ReportsView, SeasonRegistrationViewSet, SeasonViewSet, TeamAnalyticsView, TeamEventAttendanceViewSet, TeamEventViewSet, TournamentViewSet, TrainingAttendanceViewSet, TrainingSessionViewSet
 
 router = DefaultRouter()
 router.register('players', PlayerViewSet)
@@ -15,7 +15,8 @@ router.register('match-participations', MatchParticipationViewSet)
 router.register('training-attendance', TrainingAttendanceViewSet)
 router.register('team-events', TeamEventViewSet)
 router.register('team-event-attendance', TeamEventAttendanceViewSet)
-router.register('learning-resources', LearningResourceViewSet)
+router.register('learning-resources', LearningResourceViewSet, basename='learning-resource')
+router.register('news', NewsArticleViewSet, basename='news-article')
 router.register('media', MediaAssetViewSet, basename='media-asset')
 router.register('injury-records', InjuryRecordViewSet)
 router.register('alumni', AlumniProfileViewSet)

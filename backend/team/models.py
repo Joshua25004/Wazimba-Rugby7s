@@ -1,5 +1,26 @@
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
+class UserProfile(models.Model):
+    class Role(models.TextChoices):
+        MEMBER = 'member', 'Member'
+        STAFF = 'staff', 'Staff'
+        ADMINISTRATOR = 'administrator', 'Administrator'
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='team_profile')
+    role = models.CharField(max_length=20, choices=Role.choices, default=Role.MEMBER)
+    designation = models.CharField(max_length=100, blank=True)
+    can_access_welfare = models.BooleanField(default=False)
+    def __str__(self): return f'{self.user} ({self.role})'
+
+class AccountAuditLog(models.Model):
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='team_account_actions')
+    target = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='team_account_changes')
+    action = models.CharField(max_length=40, default='account.updated')
+    changes = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    class Meta: ordering = ['-created_at']
+    def __str__(self): return f'{self.action} · {self.created_at:%Y-%m-%d %H:%M}'
+
 
 class Season(models.Model):
     class Status(models.TextChoices):
@@ -109,9 +130,35 @@ class Announcement(models.Model):
     source_url = models.URLField(blank=True)
     published_at = models.DateField(auto_now_add=True)
     is_published = models.BooleanField(default=True)
+    is_featured = models.BooleanField(default=False)
     author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
     class Meta: ordering = ['-published_at', '-id']
     def __str__(self): return self.title
+
+class NewsArticle(models.Model):
+    class Kind(models.TextChoices):
+        ORIGINAL = 'original', 'Original Wazimba article'
+        EXTERNAL = 'external', 'Curated external story'
+    class Category(models.TextChoices):
+        KENYAN = 'kenyan', 'Kenyan Rugby'
+        INTERNATIONAL = 'international', 'International Rugby'
+        WAZIMBA = 'wazimba', 'Wazimba News'
+    kind = models.CharField(max_length=12, choices=Kind.choices, default=Kind.ORIGINAL)
+    category = models.CharField(max_length=20, choices=Category.choices, default=Category.WAZIMBA)
+    title = models.CharField(max_length=220)
+    summary = models.CharField(max_length=500, blank=True)
+    body = models.TextField(blank=True)
+    source_name = models.CharField(max_length=160, blank=True)
+    source_url = models.URLField(blank=True)
+    image_file = models.FileField(upload_to='news/images/%Y/%m/', blank=True)
+    published_at = models.DateTimeField(default=timezone.now)
+    is_published = models.BooleanField(default=False)
+    is_featured = models.BooleanField(default=False)
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='news_articles')
+    created_at = models.DateTimeField(auto_now_add=True)
+    class Meta: ordering = ['-published_at', '-id']
+    def __str__(self): return self.title
+
 
 class MatchReview(models.Model):
     match = models.OneToOneField(Match, on_delete=models.CASCADE, related_name='review')
@@ -160,6 +207,14 @@ class LearningResource(models.Model):
     category = models.CharField(max_length=20, choices=Category.choices)
     summary = models.TextField(blank=True)
     source_url = models.URLField(blank=True)
+    uploaded_file = models.FileField(upload_to="learning/videos/%Y/%m/", blank=True)
+    embed_url = models.URLField(blank=True)
+    topic = models.CharField(max_length=120, blank=True)
+    is_published = models.BooleanField(default=True)
+    season = models.ForeignKey('Season', on_delete=models.SET_NULL, null=True, blank=True, related_name='learning_resources')
+    match = models.ForeignKey('Match', on_delete=models.SET_NULL, null=True, blank=True, related_name='learning_resources')
+    training_session = models.ForeignKey('TrainingSession', on_delete=models.SET_NULL, null=True, blank=True, related_name='learning_resources')
+    event = models.ForeignKey('TeamEvent', on_delete=models.SET_NULL, null=True, blank=True, related_name='learning_resources')
     is_official = models.BooleanField(default=False)
     published_at = models.DateField(null=True, blank=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)

@@ -1,12 +1,16 @@
 from datetime import date, time
+from pathlib import Path
+import re
 
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from rest_framework.test import APITestCase
 
 from rest_framework.authtoken.models import Token
 
 
-from .models import (AlumniProfile, Announcement, LearningResource, MatchReview,
+from .models import (AccountAuditLog, UserProfile, AlumniProfile, Announcement, LearningResource, NewsArticle, MatchReview,
                      MediaAsset, Match, MatchParticipation, Player, Season,
                      TeamEvent, Tournament, TrainingAttendance, TrainingSession)
 
@@ -15,6 +19,8 @@ class WazimbaApiTests(APITestCase):
     def setUp(self):
         User = get_user_model()
         self.staff = User.objects.create_user(username='manager', password='test-pass-123', is_staff=True)
+        UserProfile.objects.update_or_create(user=self.staff, defaults={'role': 'staff', 'can_access_welfare': True})
+        self.staff._state.fields_cache.pop('team_profile', None)
         self.member = User.objects.create_user(username='player', password='test-pass-123')
         self.season = Season.objects.create(name='2026 Season', start_date=date(2026, 1, 1), status='active')
         self.player = Player.objects.create(full_name='Test Player', position='Centre', status='active')
@@ -25,6 +31,111 @@ class WazimbaApiTests(APITestCase):
         self.session = TrainingSession.objects.create(title='Defence', date=date(2026, 4, 3),
             start_time=time(17), season=self.season)
         TrainingAttendance.objects.create(session=self.session, player=self.player, attended=True)
+
+    def test_public_registration_always_creates_a_member(self):
+        response = self.client.post('/api/auth/register/', {
+            'username': 'new-member', 'full_name': 'New Member', 'email': 'new@example.test',
+            'password': 'Wazimba!Rugby2026', 'password_confirmation': 'Wazimba!Rugby2026',
+            'accepted_terms': True, 'role': 'administrator', 'is_staff': True, 'is_superuser': True,
+        }, format='json')
+        self.assertEqual(response.status_code, 201)
+        user = get_user_model().objects.get(username='new-member')
+        self.assertTrue(user.check_password('Wazimba!Rugby2026'))
+        self.assertFalse(user.is_staff)
+        self.assertFalse(user.is_superuser)
+        self.assertEqual(user.team_profile.role, 'member')
+
+    def test_administrator_account_management_is_protected(self):
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.client.get('/api/admin/accounts/').status_code, 403)
+        admin = get_user_model().objects.create_superuser(username='root-admin', password='Wazimba!Rugby2026')
+        self.client.force_authenticate(admin)
+        listing = self.client.get('/api/admin/accounts/')
+        self.assertEqual(listing.status_code, 200)
+        target = self.member.team_profile
+        changed = self.client.patch(f'/api/admin/accounts/{target.id}/', {'role': 'staff'}, format='json')
+        self.assertEqual(changed.status_code, 200)
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.team_profile.role, 'staff')
+        self.assertTrue(self.member.is_staff)
+        self.assertEqual(AccountAuditLog.objects.filter(actor=admin, target=self.member).count(), 1)
+
+    def test_news_articles_publish_with_visibility_and_image_upload(self):
+        self.client.force_authenticate(self.staff)
+        media_dir = Path(__file__).resolve().parent.parent / '.tmp' / 'test-news-media'
+        media_dir.mkdir(parents=True, exist_ok=True)
+        with override_settings(MEDIA_ROOT=media_dir):
+            created = self.client.post('/api/news/', {
+                'kind': 'original', 'category': 'wazimba', 'title': 'Squad update',
+                'summary': 'A Wazimba update', 'body': 'Full story content.',
+                'is_published': True, 'is_featured': True,
+                'image_file': SimpleUploadedFile('squad.png', b'\x89PNG\r\n\x1a\nimage-data', content_type='image/png'),
+            }, format='multipart')
+            self.assertEqual(created.status_code, 201, created.data)
+            self.assertTrue(created.data['image_file'])
+            article = NewsArticle.objects.get(pk=created.data['id'])
+            article.image_file.delete(save=False)
+            draft = self.client.post('/api/news/', {
+                'kind': 'original', 'category': 'wazimba', 'title': 'Draft story', 'body': 'Not public yet.',
+                'is_published': False,
+            }, format='json')
+            self.assertEqual(draft.status_code, 201)
+            invalid_external = self.client.post('/api/news/', {
+                'kind': 'external', 'category': 'international', 'title': 'Missing source',
+            }, format='json')
+            self.assertEqual(invalid_external.status_code, 400)
+            self.client.force_authenticate(self.member)
+            public_rows = self.client.get('/api/news/').data['results']
+            self.assertEqual([row['title'] for row in public_rows], ['Squad update'])
+            self.assertTrue(public_rows[0]['is_featured'])
+
+    def test_news_featured_content_is_available_to_members(self):
+        self.client.force_authenticate(self.staff)
+        created = self.client.post('/api/announcements/', {
+            'title': 'Kenya 7s update', 'category': 'Kenyan Rugby',
+            'body': 'Staff-curated source summary.', 'source_url': 'https://example.org/rugby',
+            'is_published': True, 'is_featured': True,
+        }, format='json')
+        self.assertEqual(created.status_code, 201)
+        self.client.force_authenticate(self.member)
+        story = self.client.get('/api/announcements/').data['results'][0]
+        self.assertEqual(story['category'], 'Kenyan Rugby')
+        self.assertTrue(story['is_featured'])
+
+    def test_video_resource_accepts_upload_and_rejects_untrusted_embed_hosts(self):
+        self.client.force_authenticate(self.staff)
+        media_dir = Path(__file__).resolve().parent.parent / '.tmp' / 'test-video-media'
+        media_dir.mkdir(parents=True, exist_ok=True)
+        with override_settings(MEDIA_ROOT=media_dir):
+            uploaded = self.client.post('/api/learning-resources/', {
+                'title': 'Defence drill', 'category': 'video', 'summary': 'Recorded team drill.',
+                'uploaded_file': SimpleUploadedFile('defence.mp4', b'\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00', content_type='video/mp4'),
+            }, format='multipart')
+            self.assertEqual(uploaded.status_code, 201)
+            self.assertTrue(uploaded.data['uploaded_file'])
+            LearningResource.objects.get(pk=uploaded.data['id']).uploaded_file.delete(save=False)
+            rejected = self.client.post('/api/learning-resources/', {
+                'title': 'Unsafe embed', 'category': 'video', 'embed_url': 'https://youtube.com.attacker.example/video',
+            }, format='json')
+            self.assertEqual(rejected.status_code, 400)
+
+    @override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend', PUBLIC_FRONTEND_URL='http://frontend.test/')
+    def test_password_reset_uses_expiring_token_and_generic_response(self):
+        from django.core import mail
+        self.member.email = 'player@example.test'; self.member.save(update_fields=['email'])
+        response = self.client.post('/api/auth/password-reset/', {'email': 'player@example.test'}, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'detail': 'If an account uses that email, reset instructions have been sent.'})
+        self.assertEqual(len(mail.outbox), 1)
+        match = re.search(r'uid=([^&\s]+)&token=([^&\s]+)', mail.outbox[0].body)
+        self.assertIsNotNone(match)
+        changed = self.client.post('/api/auth/password-reset/confirm/', {
+            'uid': match.group(1), 'token': match.group(2), 'password': 'Changed!Rugby2026',
+        }, format='json')
+        self.assertEqual(changed.status_code, 200)
+        self.member.refresh_from_db()
+        self.assertTrue(self.member.check_password('Changed!Rugby2026'))
+        self.assertFalse(Token.objects.filter(user=self.member).exists())
 
     def test_analytics_are_computed_from_records(self):
         self.client.force_authenticate(self.member)

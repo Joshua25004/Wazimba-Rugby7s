@@ -2,7 +2,8 @@ const BASE = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000/api';
 
 export async function api(path, options = {}) {
   const token = localStorage.getItem('wazimbaToken');
-  const headers = { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: `Token ${token}` } : {}), ...options.headers };
+  const isForm = typeof FormData !== 'undefined' && options.body instanceof FormData;
+  const headers = { ...(options.body && !isForm ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: `Token ${token}` } : {}), ...options.headers };
   const response = await fetch(`${BASE}${path}`, { ...options, headers });
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}));

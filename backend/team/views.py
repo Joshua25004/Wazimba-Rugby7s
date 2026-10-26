@@ -1,5 +1,6 @@
-from django.contrib.auth import authenticate
+from django.contrib.auth import authenticate, get_user_model
 import csv
+from django.db import transaction
 from django.db.models import Count, F, Q, Sum
 from django.db.models.deletion import ProtectedError
 from django.http import HttpResponse
@@ -11,9 +12,9 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import ValidationError
-from .models import AlumniProfile, Announcement, InjuryRecord, LearningResource, Match, MatchParticipation, MatchReview, MediaAsset, Player, Season, SeasonRegistration, TeamEvent, TeamEventAttendance, Tournament, TrainingAttendance, TrainingSession
-from .permissions import ReadOnlyOrStaff, WelfareStaffOnly
-from .serializers import AlumniProfileSerializer, AnnouncementSerializer, InjuryRecordSerializer, LearningResourceSerializer, MatchParticipationSerializer, MatchReviewSerializer, MatchSerializer, MediaAssetSerializer, PlayerSerializer, SeasonRegistrationSerializer, SeasonSerializer, TeamEventAttendanceSerializer, TeamEventSerializer, TournamentSerializer, TrainingAttendanceSerializer, TrainingSessionSerializer
+from .models import AccountAuditLog, UserProfile, AlumniProfile, Announcement, InjuryRecord, LearningResource, NewsArticle, Match, MatchParticipation, MatchReview, MediaAsset, Player, Season, SeasonRegistration, TeamEvent, TeamEventAttendance, Tournament, TrainingAttendance, TrainingSession
+from .permissions import AdministratorOnly, ReadOnlyOrStaff, WelfareStaffOnly, app_role, has_welfare_access
+from .serializers import AccountAuditLogSerializer, AccountUpdateSerializer, RegistrationSerializer, UserProfileSerializer, AlumniProfileSerializer, AnnouncementSerializer, InjuryRecordSerializer, LearningResourceSerializer, NewsArticleSerializer, MatchParticipationSerializer, MatchReviewSerializer, MatchSerializer, MediaAssetSerializer, PlayerSerializer, SeasonRegistrationSerializer, SeasonSerializer, TeamEventAttendanceSerializer, TeamEventSerializer, TournamentSerializer, TrainingAttendanceSerializer, TrainingSessionSerializer
 
 class TokenLoginView(APIView):
     permission_classes = [AllowAny]
@@ -23,12 +24,12 @@ class TokenLoginView(APIView):
         if not user or not user.is_active:
             return Response({'detail': 'Invalid username or password.'}, status=400)
         token, _ = Token.objects.get_or_create(user=user)
-        return Response({'token': token.key, 'name': user.get_full_name() or user.get_username(), 'is_staff': user.is_staff})
+        return Response({'token': token.key, 'name': user.get_full_name() or user.get_username(), 'is_staff': user.is_staff, 'role': app_role(user)})
 
 class CurrentUserView(APIView):
     def get(self, request):
         user = request.user
-        return Response({'username': user.username, 'name': user.get_full_name() or user.username, 'is_staff': user.is_staff})
+        return Response({'username': user.username, 'name': user.get_full_name() or user.username, 'is_staff': user.is_staff, 'role': app_role(user), 'designation': user.team_profile.designation, 'can_access_welfare': has_welfare_access(user)})
 
 class LogoutView(APIView):
     def post(self, request):
@@ -46,14 +47,22 @@ class DashboardView(APIView):
         next_training = upcoming_training.order_by('date', 'start_time').first()
         completed = matches.filter(status=Match.Status.COMPLETED).exclude(wazimba_score__isnull=True).exclude(opponent_score__isnull=True)
         wins = completed.filter(wazimba_score__gt=F('opponent_score')).count()
-        return Response({'active_season': SeasonSerializer(active_season).data if active_season else None,
+        payload = {'active_season': SeasonSerializer(active_season).data if active_season else None,
             'active_players': Player.objects.filter(status=Player.Status.ACTIVE).count(),
             'matches_played': completed.count(), 'upcoming_matches': matches.filter(status=Match.Status.SCHEDULED, date__gte=today).count(),
             'training_sessions': TrainingSession.objects.filter(season=active_season).count() if active_season else TrainingSession.objects.count(), 'wins': wins,
             'win_rate': round(wins * 100 / completed.count()) if completed.exists() else None,
             'next_match': MatchSerializer(next_match).data if next_match else None,
             'next_training': TrainingSessionSerializer(next_training).data if next_training else None,
-            'recent_announcements': AnnouncementSerializer(Announcement.objects.filter(is_published=True)[:5], many=True).data})
+            'upcoming_events': TeamEventSerializer(TeamEvent.objects.filter(date__gte=today).order_by('date')[:5], many=True).data,
+            'recent_announcements': AnnouncementSerializer(Announcement.objects.filter(is_published=True)[:5], many=True).data,
+            'recent_news': NewsArticleSerializer(NewsArticle.objects.filter(is_published=True)[:4], many=True).data}
+        if app_role(request.user) == UserProfile.Role.ADMINISTRATOR:
+            payload['accounts'] = list(UserProfile.objects.values('role').annotate(total=Count('id'), active=Count('id', filter=Q(user__is_active=True))))
+            payload['active_accounts'] = get_user_model().objects.filter(is_active=True).count()
+            payload['inactive_accounts'] = get_user_model().objects.filter(is_active=False).count()
+            payload['recent_admin_activity'] = AccountAuditLogSerializer(AccountAuditLog.objects.select_related('actor', 'target')[:8], many=True).data
+        return Response(payload)
 
 class StaffWriteViewSet(viewsets.ModelViewSet):
     permission_classes = [ReadOnlyOrStaff]
@@ -92,9 +101,18 @@ class TeamEventAttendanceViewSet(StaffWriteViewSet):
     queryset = TeamEventAttendance.objects.select_related('event', 'player').all()
     serializer_class = TeamEventAttendanceSerializer
 class LearningResourceViewSet(StaffWriteViewSet):
-    queryset = LearningResource.objects.select_related('created_by').all()
     serializer_class = LearningResourceSerializer
+    def get_queryset(self):
+        qs = LearningResource.objects.select_related('created_by', 'season', 'match', 'training_session', 'event').all()
+        return qs if self.request.user.is_staff else qs.filter(is_published=True)
     def perform_create(self, serializer): serializer.save(created_by=self.request.user)
+
+class NewsArticleViewSet(StaffWriteViewSet):
+    serializer_class = NewsArticleSerializer
+    def get_queryset(self):
+        qs = NewsArticle.objects.select_related('author').all()
+        return qs if self.request.user.is_staff else qs.filter(is_published=True)
+    def perform_create(self, serializer): serializer.save(author=self.request.user)
 class MediaAssetViewSet(StaffWriteViewSet):
     serializer_class = MediaAssetSerializer
     def get_queryset(self):
@@ -190,4 +208,85 @@ class ReportsCSVView(APIView):
         for player in payload['players']:
             writer.writerow([player['player__full_name'], player['player__position'], player['appearances'], player['minutes'] or 0, player['tries'] or 0, player['assists'] or 0, player['tackles'] or 0, player['turnovers_won'] or 0, player['errors'] or 0])
         return response
+
+
+class RegistrationView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    def post(self, request):
+        serializer = RegistrationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response({'detail': 'Account created. You can now sign in.', 'username': user.username}, status=status.HTTP_201_CREATED)
+
+class AccountManagementView(APIView):
+    permission_classes = [AdministratorOnly]
+    def get(self, request):
+        from django.contrib.auth import get_user_model
+        profiles = UserProfile.objects.select_related('user').filter(user__username__icontains=request.query_params.get('search', '')).order_by('user__username')
+        return Response(UserProfileSerializer(profiles, many=True).data)
+    @transaction.atomic
+    def patch(self, request, pk):
+        from django.contrib.auth import get_user_model
+        profile = get_object_or_404(UserProfile.objects.select_related('user'), pk=pk)
+        serializer = AccountUpdateSerializer(profile, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        target = profile.user
+        before = {'role': profile.role, 'designation': profile.designation, 'can_access_welfare': profile.can_access_welfare, 'is_active': target.is_active}
+        next_role = serializer.validated_data.get('role', profile.role)
+        next_active = serializer.validated_data.get('is_active', target.is_active)
+        if profile.role == UserProfile.Role.ADMINISTRATOR and target.is_active and (next_role != UserProfile.Role.ADMINISTRATOR or not next_active):
+            admins = UserProfile.objects.select_for_update().filter(role=UserProfile.Role.ADMINISTRATOR, user__is_active=True).exclude(pk=profile.pk).count()
+            if admins == 0:
+                return Response({'detail': 'At least one active administrator must remain.'}, status=409)
+        if target.pk == request.user.pk and (next_role != UserProfile.Role.ADMINISTRATOR or not next_active):
+            return Response({'detail': 'You cannot remove your own administrator access.'}, status=409)
+        profile = serializer.save()
+        # Keep Django admin access aligned with application roles.
+        profile.user.is_staff = profile.role in (UserProfile.Role.STAFF, UserProfile.Role.ADMINISTRATOR)
+        profile.user.is_superuser = profile.role == UserProfile.Role.ADMINISTRATOR and profile.user.is_superuser
+        profile.user.save(update_fields=['is_staff', 'is_superuser'])
+        after = {'role': profile.role, 'designation': profile.designation, 'can_access_welfare': profile.can_access_welfare, 'is_active': profile.user.is_active}
+        changes = {key: {'from': before[key], 'to': after[key]} for key in before if before[key] != after[key]}
+        if changes:
+            AccountAuditLog.objects.create(actor=request.user, target=profile.user, changes=changes)
+        return Response(UserProfileSerializer(profile).data)
+
+class PasswordResetRequestView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    def post(self, request):
+        from django.conf import settings
+        from django.contrib.auth import get_user_model
+        from django.contrib.auth.tokens import default_token_generator
+        from django.core.mail import send_mail
+        from django.utils.encoding import force_bytes
+        from django.utils.http import urlsafe_base64_encode
+        email = request.data.get('email', '')
+        for user in get_user_model().objects.filter(email__iexact=email, is_active=True):
+            uid = urlsafe_base64_encode(force_bytes(user.pk))
+            token = default_token_generator.make_token(user)
+            base = getattr(settings, 'PUBLIC_FRONTEND_URL', 'http://localhost:5173/')
+            link = f"{base}?reset=1&uid={uid}&token={token}"
+            send_mail('Reset your Wazimba password', f"Use this secure link to reset your password. It expires automatically.\n\n{link}", settings.DEFAULT_FROM_EMAIL, [user.email], fail_silently=True)
+        return Response({'detail': 'If an account uses that email, reset instructions have been sent.'})
+
+class PasswordResetConfirmView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    def post(self, request):
+        from django.contrib.auth import get_user_model, password_validation
+        from django.contrib.auth.tokens import default_token_generator
+        from django.utils.http import urlsafe_base64_decode
+        uid = request.data.get('uid', '')
+        try: user = get_user_model().objects.get(pk=urlsafe_base64_decode(uid).decode())
+        except Exception: user = None
+        if not user or not default_token_generator.check_token(user, request.data.get('token', '')):
+            return Response({'detail': 'This password reset link is invalid or has expired.'}, status=400)
+        password = request.data.get('password', '')
+        try: password_validation.validate_password(password, user)
+        except Exception as exc: return Response({'password': getattr(exc, 'messages', ['Choose a stronger password.'])}, status=400)
+        user.set_password(password); user.save(update_fields=['password'])
+        Token.objects.filter(user=user).delete()
+        return Response({'detail': 'Password changed. Please sign in again.'})
 
