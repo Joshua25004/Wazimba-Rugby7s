@@ -36,8 +36,38 @@ class MatchReviewSerializer(serializers.ModelSerializer):
 class MatchParticipationSerializer(serializers.ModelSerializer):
     player_name = serializers.CharField(source='player.full_name', read_only=True)
     class Meta: model = MatchParticipation; fields = '__all__'
+
+
 class TrainingAttendanceSerializer(serializers.ModelSerializer):
-    player_name = serializers.CharField(source='player.full_name', read_only=True)
+    player_name = serializers.CharField(
+        source='player.full_name',
+        read_only=True,
+    )
+
+    class Meta:
+        model = TrainingAttendance
+        fields = '__all__'
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+
+        # Keep attendance notes private from ordinary members.
+        if not (request and request.user.is_staff):
+            data['notes'] = ''
+
+        return data
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+
+        # Keep attendance notes private from ordinary members.
+        if not (request and request.user.is_staff):
+            data['notes'] = ''
+
+        return data
+
     class Meta: model = TrainingAttendance; fields = '__all__'
 class TeamEventSerializer(serializers.ModelSerializer):
     class Meta: model = TeamEvent; fields = '__all__'

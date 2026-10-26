@@ -30,6 +30,11 @@ class CurrentUserView(APIView):
         user = request.user
         return Response({'username': user.username, 'name': user.get_full_name() or user.username, 'is_staff': user.is_staff})
 
+class LogoutView(APIView):
+    def post(self, request):
+        request.user.auth_token.delete()
+        return Response({'detail': 'Logged out successfully.'}, status=status.HTTP_200_OK)
+
 class DashboardView(APIView):
     def get(self, request):
         active_season = Season.objects.filter(status=Season.Status.ACTIVE).first()

@@ -39,7 +39,21 @@ function App() {
   };
 
   useEffect(() => { refresh(); }, [token]);
-  const logout = () => { localStorage.removeItem('wazimbaToken'); localStorage.removeItem('wazimbaUser'); localStorage.removeItem('wazimbaStaff'); setToken(null); setIsStaff(false); setUser('Team Captain'); };
+
+const logout = async () => {
+  try {
+    await api('/auth/logout/', { method: 'POST' });
+  } catch (error) {
+    console.error('Server logout failed:', error);
+  } finally {
+    localStorage.removeItem('wazimbaToken');
+    localStorage.removeItem('wazimbaUser');
+    localStorage.removeItem('wazimbaStaff');
+    setToken(null);
+    setIsStaff(false);
+    setUser('Team Captain');
+  }
+};
 
   if (!token) return <Login onLogin={(t, name, staff) => { localStorage.setItem('wazimbaToken', t); localStorage.setItem('wazimbaUser', name); localStorage.setItem('wazimbaStaff', String(staff)); setToken(t); setUser(name); setIsStaff(staff); }} />;
   const active = nav.find(section => section.items.includes(page));

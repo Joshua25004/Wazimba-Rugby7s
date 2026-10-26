@@ -3,6 +3,9 @@ from datetime import date, time
 from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase
 
+from rest_framework.authtoken.models import Token
+
+
 from .models import (AlumniProfile, Announcement, LearningResource, MatchReview,
                      MediaAsset, Match, MatchParticipation, Player, Season,
                      TeamEvent, Tournament, TrainingAttendance, TrainingSession)
@@ -56,6 +59,20 @@ class WazimbaApiTests(APITestCase):
         self.assertTrue(success.data['is_staff'])
         failure = self.client.post('/api/auth/token/', {'username': 'manager', 'password': 'wrong'}, format='json')
         self.assertEqual(failure.status_code, 400)
+
+
+    def test_login_rejects_missing_credentials(self):
+        # Submit a login request without a username or password.
+        response = self.client.post(
+            '/api/auth/token/',
+            {},
+            format='json',
+        )
+
+        # Login must fail and must not return an authentication token.
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn('token', response.data)
+
 
     def test_authentication_and_staff_write_permissions_are_enforced(self):
         self.client.force_authenticate(user=None)
@@ -127,7 +144,7 @@ class WazimbaApiTests(APITestCase):
         self.client.force_authenticate(self.member)
         self.assertEqual(self.client.get('/api/performance/team/', {'season': 'not-a-number'}).status_code, 400)
         self.assertEqual(self.client.get('/api/performance/players/', {'player': 'not-a-number'}).status_code, 400)
-    
+
     def test_alumni_contact_email_respects_consent(self):
         alumni = AlumniProfile.objects.create(
             full_name='Privacy Test Alumni',
@@ -161,7 +178,7 @@ class WazimbaApiTests(APITestCase):
             response.data['contact_email'],
             'private@example.org',
         )
-        
+
     def test_match_reviews_are_readable_by_members_but_writable_only_by_staff(self):
         review = MatchReview.objects.create(
             match=self.match,
@@ -206,7 +223,7 @@ class WazimbaApiTests(APITestCase):
             self.client.delete(f'/api/match-reviews/{review.id}/').status_code,
             204,
         )
-        
+
     def test_player_email_is_visible_to_staff_only(self):
         player = Player.objects.create(
             full_name='Privacy Test Player',
@@ -227,4 +244,591 @@ class WazimbaApiTests(APITestCase):
         self.assertEqual(
             response.data['email'],
             'player-private@example.org',
+        )
+
+    def test_training_attendance_notes_are_visible_to_staff_only(self):
+        attendance = TrainingAttendance.objects.get(
+            session=self.session,
+            player=self.player,
+        )
+        attendance.notes = 'Private welfare follow-up'
+        attendance.save(update_fields=['notes'])
+
+        # Members can view attendance, but not private notes.
+        self.client.force_authenticate(self.member)
+        response = self.client.get(
+            f'/api/training-attendance/{attendance.id}/'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['attended'], True)
+        self.assertEqual(response.data['notes'], '')
+
+        # Staff can view the notes.
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(
+            f'/api/training-attendance/{attendance.id}/'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data['notes'],
+            'Private welfare follow-up',
+        )
+
+    def test_training_attendance_is_read_only_for_members(self):
+        attendance = TrainingAttendance.objects.get(
+            session=self.session,
+            player=self.player,
+        )
+        url = f'/api/training-attendance/{attendance.id}/'
+
+        self.client.force_authenticate(self.member)
+
+        # Members should not be able to change attendance.
+        response = self.client.patch(
+            url,
+            {'attended': False},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+
+        # Members should not be able to delete attendance.
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 403)
+
+        # Confirm the attendance record remains unchanged.
+        attendance.refresh_from_db()
+        self.assertTrue(attendance.attended)
+
+
+    def test_staff_can_update_training_attendance(self):
+        attendance = TrainingAttendance.objects.get(
+            session=self.session,
+            player=self.player,
+        )
+        url = f'/api/training-attendance/{attendance.id}/'
+
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.patch(
+            url,
+            {'attended': False},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        attendance.refresh_from_db()
+        self.assertFalse(attendance.attended)
+    def test_announcements_are_read_only_for_members(self):
+        announcement = Announcement.objects.create(
+            title='Training Update',
+            body='Training is scheduled for Friday.',
+            is_published=True,
+            author=self.staff,
+        )
+        url = f'/api/announcements/{announcement.id}/'
+
+        self.client.force_authenticate(self.member)
+
+        # Members can read published announcements.
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        # Members cannot edit or delete announcements.
+        response = self.client.patch(
+            url,
+            {'title': 'Unauthorized Update'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 403)
+
+        # Confirm the original title remains unchanged.
+        announcement.refresh_from_db()
+        self.assertEqual(announcement.title, 'Training Update')
+
+        # Members cannot create announcements.
+        response = self.client.post(
+            '/api/announcements/',
+            {
+                'title': 'Unauthorized Announcement',
+                'body': 'This should not be published.',
+                'is_published': True,
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+
+
+    def test_staff_can_create_and_update_announcements(self):
+        self.client.force_authenticate(self.staff)
+
+        # Staff can create an announcement.
+        response = self.client.post(
+            '/api/announcements/',
+            {
+                'title': 'Training Update',
+                'body': 'Training is scheduled for Friday.',
+                'is_published': True,
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201)
+
+        announcement_id = response.data['id']
+        url = f'/api/announcements/{announcement_id}/'
+
+        # Staff can update the announcement.
+        response = self.client.patch(
+            url,
+            {'title': 'Updated Training Notice'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(
+            response.data['title'],
+            'Updated Training Notice',
+        )
+
+
+    def test_injury_records_are_accessible_to_staff_only(self):
+        from .models import InjuryRecord
+
+        injury = InjuryRecord.objects.create(
+            player=self.player,
+            injury_date=date(2026, 4, 1),
+            description='Test knee injury',
+            status='assessed',
+            staff_notes='Private medical follow-up',
+        )
+        url = f'/api/injury-records/{injury.id}/'
+
+        # Ordinary members must not access injury records.
+        self.client.force_authenticate(self.member)
+
+        response = self.client.get('/api/injury-records/')
+        self.assertEqual(response.status_code, 403)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 403)
+
+        # Staff should be able to list and retrieve injury records.
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get('/api/injury-records/')
+        self.assertEqual(response.status_code, 200)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data['staff_notes'],
+            'Private medical follow-up',
+        )
+
+
+
+    def test_media_visibility_respects_consent(self):
+        confirmed_media = MediaAsset.objects.create(
+            title='Approved Team Photo',
+            category='team',
+            media_url='https://example.com/approved.jpg',
+            consent_confirmed=True,
+            season=self.season,
+        )
+        unconfirmed_media = MediaAsset.objects.create(
+            title='Unapproved Team Photo',
+            category='team',
+            media_url='https://example.com/unapproved.jpg',
+            consent_confirmed=False,
+            season=self.season,
+        )
+
+        # Members should see only media with confirmed consent.
+        self.client.force_authenticate(self.member)
+        response = self.client.get('/api/media/')
+
+        self.assertEqual(response.status_code, 200)
+        member_ids = {
+            item['id'] for item in response.data['results']
+        }
+        self.assertIn(confirmed_media.id, member_ids)
+        self.assertNotIn(unconfirmed_media.id, member_ids)
+
+        # Staff should see both approved and unapproved media.
+        self.client.force_authenticate(self.staff)
+        response = self.client.get('/api/media/')
+
+        self.assertEqual(response.status_code, 200)
+        staff_ids = {
+            item['id'] for item in response.data['results']
+        }
+        self.assertIn(confirmed_media.id, staff_ids)
+        self.assertIn(unconfirmed_media.id, staff_ids)
+
+
+    def test_learning_resources_are_read_only_for_members(self):
+        resource = LearningResource.objects.create(
+            title='Rugby Laws Guide',
+            category='law',
+            summary='A guide to rugby rules and laws.',
+            source_url='https://example.com/rugby-laws',
+            is_official=True,
+            created_by=self.staff,
+        )
+        url = f'/api/learning-resources/{resource.id}/'
+
+        self.client.force_authenticate(self.member)
+
+        # Members can read resources.
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        # Members cannot edit or delete resources.
+        response = self.client.patch(
+            url,
+            {'title': 'Unauthorized Change'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 403)
+
+        # Members cannot create resources.
+        response = self.client.post(
+            '/api/learning-resources/',
+            {
+                'title': 'Unauthorized Resource',
+                'category': 'law',
+                'summary': 'This should not be created.',
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+
+        # Confirm the original record was not changed.
+        resource.refresh_from_db()
+        self.assertEqual(resource.title, 'Rugby Laws Guide')
+
+
+    def test_team_events_are_read_only_for_members(self):
+        event = TeamEvent.objects.create(
+            title='Team Bonding Day',
+            category='bonding',
+            date=date(2026, 11, 15),
+            start_time=time(10, 0),
+            location='Laikipia University',
+            description='Team bonding activities.',
+            season=self.season,
+        )
+        url = f'/api/team-events/{event.id}/'
+
+        self.client.force_authenticate(self.member)
+
+        # Members can view events.
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        # Members cannot edit or delete events.
+        response = self.client.patch(
+            url,
+            {'title': 'Unauthorized Event Change'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 403)
+
+        # Members cannot create events.
+        response = self.client.post(
+        '/api/team-events/',
+            {
+                'title': 'Unauthorized Event',
+                'category': 'other',
+                'date': '2026-11-16',
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+
+        # Confirm the event remains unchanged.
+        event.refresh_from_db()
+        self.assertEqual(event.title, 'Team Bonding Day')
+
+
+    def test_tournaments_are_read_only_for_members(self):
+        tournament = Tournament.objects.create(
+            name='Laikipia Rugby Sevens',
+            location='Nanyuki',
+            organizer='Laikipia University',
+            start_date=date(2026, 11, 20),
+            end_date=date(2026, 11, 21),
+            status='upcoming',
+            season=self.season,
+        )
+        url = f'/api/tournaments/{tournament.id}/'
+
+        self.client.force_authenticate(self.member)
+
+        # Members can view tournaments.
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        # Members cannot edit or delete tournaments.
+        response = self.client.patch(
+            url,
+            {'name': 'Unauthorized Tournament Change'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, 403)
+
+        # Members cannot create tournaments.
+        response = self.client.post(
+            '/api/tournaments/',
+            {
+                'name': 'Unauthorized Tournament',
+                'status': 'upcoming',
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+
+        # Confirm the original tournament remains unchanged.
+        tournament.refresh_from_db()
+        self.assertEqual(tournament.name, 'Laikipia Rugby Sevens')
+
+def test_matches_are_read_only_for_members(self):
+    url = f'/api/matches/{self.match.id}/'
+
+    # Members can view matches.
+    self.client.force_authenticate(user=self.member)
+    response = self.client.get(url)
+    self.assertEqual(response.status_code, 200)
+
+    # Members cannot edit or delete matches.
+    response = self.client.patch(url, {'opponent': 'Changed RFC'})
+    self.assertEqual(response.status_code, 403)
+
+    response = self.client.delete(url)
+    self.assertEqual(response.status_code, 403)
+
+    # Members cannot create matches.
+    response = self.client.post('/api/matches/', {
+        'opponent': 'New RFC',
+        'date': '2026-05-01',
+        'status': 'upcoming',
+        'wazimba_score': 0,
+        'opponent_score': 0,
+        'season': self.season.id,
+    })
+    self.assertEqual(response.status_code, 403)
+
+    # The original match remains unchanged.
+    self.match.refresh_from_db()
+    self.assertEqual(self.match.opponent, 'Test RFC')
+
+
+def test_players_are_read_only_for_members(self):
+    url = f'/api/players/{self.player.id}/'
+
+    # Members can view player records.
+    self.client.force_authenticate(user=self.member)
+    response = self.client.get(url)
+    self.assertEqual(response.status_code, 200)
+
+    # Members cannot edit or delete player records.
+    response = self.client.patch(url, {'full_name': 'Changed Player'})
+    self.assertEqual(response.status_code, 403)
+
+    response = self.client.delete(url)
+    self.assertEqual(response.status_code, 403)
+
+    # Members cannot create player records.
+    response = self.client.post('/api/players/', {
+        'full_name': 'New Player',
+        'position': 'Centre',
+        'status': 'active',
+    })
+    self.assertEqual(response.status_code, 403)
+
+    # The original player remains unchanged.
+    self.player.refresh_from_db()
+    self.assertEqual(self.player.full_name, 'Test Player')
+
+
+def test_seasons_are_read_only_for_members(self):
+    url = f'/api/seasons/{self.season.id}/'
+
+    # Members can view season information.
+    self.client.force_authenticate(user=self.member)
+    response = self.client.get(url)
+    self.assertEqual(response.status_code, 200)
+
+    # Members cannot edit or delete seasons.
+    response = self.client.patch(url, {'name': 'Changed Season'})
+    self.assertEqual(response.status_code, 403)
+
+    response = self.client.delete(url)
+    self.assertEqual(response.status_code, 403)
+
+    # Members cannot create seasons.
+    response = self.client.post('/api/seasons/', {
+        'name': 'New Season',
+        'start_date': '2027-01-01',
+        'status': 'upcoming',
+    })
+    self.assertEqual(response.status_code, 403)
+
+    # The original season remains unchanged.
+    self.season.refresh_from_db()
+    self.assertEqual(self.season.name, '2026 Season')
+
+
+def test_match_participations_are_read_only_for_members(self):
+    participation = MatchParticipation.objects.get(
+        match=self.match,
+        player=self.player,
+    )
+    url = f'/api/match-participations/{participation.id}/'
+
+    # Members can view participation statistics.
+    self.client.force_authenticate(user=self.member)
+    response = self.client.get(url)
+    self.assertEqual(response.status_code, 200)
+
+    # Members cannot edit or delete participation records.
+    response = self.client.patch(url, {'tries': 5})
+    self.assertEqual(response.status_code, 403)
+
+    response = self.client.delete(url)
+    self.assertEqual(response.status_code, 403)
+
+    # Members cannot create participation records.
+    response = self.client.post('/api/match-participations/', {
+        'match': self.match.id,
+        'player': self.player.id,
+        'started': True,
+        'minutes_played': 40,
+        'tries': 5,
+        'tackles': 7,
+        'assists': 1,
+        'turnovers_won': 1,
+        'errors': 0,
+    })
+    self.assertEqual(response.status_code, 403)
+
+    # The original statistics remain unchanged.
+    participation.refresh_from_db()
+    self.assertEqual(participation.tries, 2)
+
+
+def test_training_sessions_are_read_only_for_members(self):
+    url = f'/api/training-sessions/{self.session.id}/'
+
+    # Members can view training sessions.
+    self.client.force_authenticate(user=self.member)
+    response = self.client.get(url)
+    self.assertEqual(response.status_code, 200)
+
+    # Members cannot edit or delete training sessions.
+    response = self.client.patch(url, {'title': 'Changed Training'})
+    self.assertEqual(response.status_code, 403)
+
+    response = self.client.delete(url)
+    self.assertEqual(response.status_code, 403)
+
+    # Members cannot create training sessions.
+    response = self.client.post('/api/training-sessions/', {
+        'title': 'New Training',
+        'date': '2026-05-01',
+        'start_time': '17:00:00',
+        'season': self.season.id,
+    })
+    self.assertEqual(response.status_code, 403)
+
+    # The original session remains unchanged.
+    self.session.refresh_from_db()
+    self.assertEqual(self.session.title, 'Defence')
+
+
+def test_alumni_profiles_are_read_only_for_members(self):
+    alumni = AlumniProfile.objects.create(
+        full_name='Former Player',
+        email='alumni@example.com',
+        consent_to_share_contact=True,
+    )
+    url = f'/api/alumni/{alumni.id}/'
+
+    # Members can view alumni profiles.
+    self.client.force_authenticate(user=self.member)
+    response = self.client.get(url)
+    self.assertEqual(response.status_code, 200)
+
+    # Members cannot edit or delete profiles.
+    response = self.client.patch(url, {'full_name': 'Changed Name'})
+    self.assertEqual(response.status_code, 403)
+
+    response = self.client.delete(url)
+    self.assertEqual(response.status_code, 403)
+
+    # Members cannot create profiles.
+    response = self.client.post('/api/alumni/', {
+        'full_name': 'New Alumni',
+        'email': 'newalumni@example.com',
+    })
+    self.assertEqual(response.status_code, 403)
+
+    # The original profile remains unchanged.
+    alumni.refresh_from_db()
+    self.assertEqual(alumni.full_name, 'Former Player')
+
+
+def test_dashboard_requires_authentication(self):
+    url = '/api/dashboard/'
+
+    # Unauthenticated visitors must not access the dashboard.
+    self.client.force_authenticate(user=None)
+    response = self.client.get(url)
+    self.assertEqual(response.status_code, 401)
+
+    # Authenticated members can view the dashboard.
+    self.client.force_authenticate(user=self.member)
+    response = self.client.get(url)
+    self.assertEqual(response.status_code, 200)
+
+    # Verify that the dashboard returns its expected information.
+    self.assertIn('active_players', response.data)
+    self.assertIn('matches_played', response.data)
+    self.assertIn('upcoming_matches', response.data)
+    self.assertIn('recent_announcements', response.data)
+
+
+    def test_inactive_users_cannot_log_in(self):
+        User = get_user_model()
+        inactive_user = User.objects.create_user(
+            username='inactive_player',
+            password='test-pass-123',
+            is_active=False,
+        )
+
+        response = self.client.post(
+            '/api/auth/token/',
+            {
+                'username': 'inactive_player',
+                'password': 'test-pass-123',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn('token', response.data)
+        self.assertFalse(
+            Token.objects.filter(user=inactive_user).exists()
         )
